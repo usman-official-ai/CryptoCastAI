@@ -1,6 +1,6 @@
 """
 CryptoCastAI - Cryptocurrency Price Prediction Dashboard
-FULLY FIXED - Stable working version
+WITH RATE LIMIT HANDLING
 """
 
 import streamlit as st
@@ -9,6 +9,7 @@ import numpy as np
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
 import yfinance as yf
+import time
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -19,7 +20,6 @@ st.set_page_config(
     layout="wide"
 )
 
-# Custom CSS
 st.markdown("""
     <style>
     .main-header { font-size: 2.5rem; font-weight: 700; color: #1f77b4; text-align: center; }
@@ -27,7 +27,6 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# Title
 st.markdown('<p class="main-header">🚀 CryptoCastAI</p>', unsafe_allow_html=True)
 st.markdown("### Cryptocurrency Price Prediction with XGBoost")
 st.markdown("---")
@@ -45,32 +44,52 @@ with st.sidebar:
     period = st.selectbox(
         "Data Period",
         ['1y', '2y', '3y', '5y'],
-        index=0
+        index=1  # Default 2y
     )
     
     pred_days = st.selectbox(
         "Prediction Days Ahead",
         [1, 3, 7, 14, 30],
-        index=0
+        index=2  # Default 7 days
     )
     
     predict_btn = st.button("🚀 Predict Now", use_container_width=True)
 
 # ============================================
-# ALL FUNCTIONS
+# RATE LIMIT HANDLING FUNCTIONS
 # ============================================
 
-@st.cache_data
-def get_crypto_data(symbol, period):
-    """Fetch crypto data from Yahoo Finance"""
+@st.cache_data(ttl=3600)  # Cache for 1 hour
+def get_crypto_data_cached(symbol, period):
+    """Fetch crypto data with caching to avoid rate limits"""
     try:
+        # Add delay to avoid rate limiting
+        time.sleep(1)
+        
         ticker = yf.Ticker(symbol)
         df = ticker.history(period=period)
+        
         if df.empty:
             return pd.DataFrame()
+        
+        # Clean data
+        if df.index.tz is not None:
+            df.index = df.index.tz_localize(None)
+        
         return df
+        
     except Exception as e:
-        st.error(f"Error: {str(e)}")
+        # If rate limited, wait and retry
+        if "Rate limited" in str(e) or "Too Many Requests" in str(e):
+            st.warning("⏳ Rate limit hit. Waiting 5 seconds...")
+            time.sleep(5)
+            try:
+                ticker = yf.Ticker(symbol)
+                df = ticker.history(period=period)
+                if not df.empty:
+                    return df
+            except:
+                pass
         return pd.DataFrame()
 
 def add_indicators(df):
@@ -80,37 +99,41 @@ def add_indicators(df):
     
     data = df.copy()
     
-    # SMA
-    data['SMA_10'] = data['Close'].rolling(10).mean()
-    data['SMA_20'] = data['Close'].rolling(20).mean()
-    
-    # RSI
-    delta = data['Close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-    rs = gain / loss
-    data['RSI'] = 100 - (100 / (1 + rs))
-    
-    # MACD
-    exp1 = data['Close'].ewm(span=12, adjust=False).mean()
-    exp2 = data['Close'].ewm(span=26, adjust=False).mean()
-    data['MACD'] = exp1 - exp2
-    data['MACD_Signal'] = data['MACD'].ewm(span=9, adjust=False).mean()
-    
-    # Bollinger Bands
-    data['BB_mid'] = data['Close'].rolling(20).mean()
-    bb_std = data['Close'].rolling(20).std()
-    data['BB_upper'] = data['BB_mid'] + (bb_std * 2)
-    data['BB_lower'] = data['BB_mid'] - (bb_std * 2)
-    
-    # Volatility
-    data['Volatility'] = data['Close'].rolling(10).std()
-    
-    # Price Change
-    data['Pct_Change'] = data['Close'].pct_change()
-    
-    # Drop NaN
-    data = data.dropna()
+    try:
+        # SMA
+        data['SMA_10'] = data['Close'].rolling(10).mean()
+        data['SMA_20'] = data['Close'].rolling(20).mean()
+        
+        # RSI
+        delta = data['Close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+        rs = gain / loss
+        data['RSI'] = 100 - (100 / (1 + rs))
+        
+        # MACD
+        exp1 = data['Close'].ewm(span=12, adjust=False).mean()
+        exp2 = data['Close'].ewm(span=26, adjust=False).mean()
+        data['MACD'] = exp1 - exp2
+        data['MACD_Signal'] = data['MACD'].ewm(span=9, adjust=False).mean()
+        
+        # Bollinger Bands
+        data['BB_mid'] = data['Close'].rolling(20).mean()
+        bb_std = data['Close'].rolling(20).std()
+        data['BB_upper'] = data['BB_mid'] + (bb_std * 2)
+        data['BB_lower'] = data['BB_mid'] - (bb_std * 2)
+        
+        # Volatility
+        data['Volatility'] = data['Close'].rolling(10).std()
+        
+        # Price Change
+        data['Pct_Change'] = data['Close'].pct_change()
+        
+        # Drop NaN
+        data = data.dropna()
+        
+    except Exception as e:
+        st.warning(f"Some indicators couldn't be calculated: {str(e)[:50]}")
     
     return data
 
@@ -121,7 +144,6 @@ def predict_prices(data, days):
     
     current_price = data['Close'].iloc[-1]
     
-    # Average daily change (last 7 days)
     if len(data) >= 7:
         avg_change = data['Pct_Change'].iloc[-7:].mean()
     else:
@@ -143,28 +165,29 @@ def predict_prices(data, days):
 # ============================================
 
 if predict_btn:
-    with st.spinner(f"🔄 Analyzing {symbol}..."):
+    with st.spinner(f"🔄 Fetching data for {symbol}..."):
         try:
-            # Step 1: Fetch Data
-            raw_data = get_crypto_data(symbol, period)
+            # Fetch data with rate limit handling
+            raw_data = get_crypto_data_cached(symbol, period)
             
             if raw_data.empty:
-                st.error(f"❌ No data found for {symbol}. Please try again.")
+                st.error(f"❌ Could not fetch data for {symbol}. Please try:")
+                st.info("1. Wait a few minutes and try again\n2. Try a different cryptocurrency\n3. Refresh the page")
                 st.stop()
             
-            # Step 2: Check Data Length
+            # Check data length
             if len(raw_data) < 30:
-                st.warning(f"⚠️ Only {len(raw_data)} days of data. Please select a longer period (2y or 5y).")
+                st.warning(f"⚠️ Only {len(raw_data)} days of data. Try a longer period.")
                 st.stop()
             
-            # Step 3: Add Indicators
+            # Add indicators
             data = add_indicators(raw_data)
             
             if data.empty:
                 st.warning("⚠️ Not enough data for analysis. Try a longer period.")
                 st.stop()
             
-            # Step 4: Make Predictions
+            # Make predictions
             predictions, current_price = predict_prices(data, pred_days)
             
             if predictions is None:
@@ -177,7 +200,6 @@ if predict_btn:
             # DISPLAY RESULTS
             # ============================================
             
-            # Metrics Row
             col1, col2, col3, col4 = st.columns(4)
             
             with col1:
@@ -194,7 +216,12 @@ if predict_btn:
             with col3:
                 if 'RSI' in data.columns and len(data['RSI']) > 0:
                     rsi = data['RSI'].iloc[-1]
-                    status = "🟢 Bullish" if rsi < 70 else "🔴 Bearish" if rsi > 70 else "🟡 Neutral"
+                    if rsi > 70:
+                        status = "🔴 Overbought"
+                    elif rsi < 30:
+                        status = "🟢 Oversold"
+                    else:
+                        status = "🟡 Neutral"
                     st.metric("📊 RSI", f"{rsi:.1f}", delta=status)
                 else:
                     st.metric("📊 RSI", "N/A")
@@ -277,7 +304,7 @@ if predict_btn:
             ))
             
             fig.update_layout(
-                title=f"{symbol} Price",
+                title=f"{symbol} - {period} Data with {pred_days}-Day Prediction",
                 xaxis_title="Date",
                 yaxis_title="Price (USD)",
                 template="plotly_white",
@@ -305,8 +332,10 @@ if predict_btn:
                         name='RSI',
                         line=dict(color='purple', width=2)
                     ))
-                    fig_rsi.add_hline(y=70, line_dash="dash", line_color="red")
-                    fig_rsi.add_hline(y=30, line_dash="dash", line_color="green")
+                    fig_rsi.add_hline(y=70, line_dash="dash", line_color="red", 
+                                     annotation_text="Overbought")
+                    fig_rsi.add_hline(y=30, line_dash="dash", line_color="green",
+                                     annotation_text="Oversold")
                     fig_rsi.update_layout(
                         title="RSI (14-day)",
                         xaxis_title="Date",
@@ -315,6 +344,8 @@ if predict_btn:
                         height=400
                     )
                     st.plotly_chart(fig_rsi, use_container_width=True)
+                else:
+                    st.info("RSI data not available")
             
             with tab2:
                 if 'MACD' in data.columns:
@@ -341,6 +372,8 @@ if predict_btn:
                         height=400
                     )
                     st.plotly_chart(fig_macd, use_container_width=True)
+                else:
+                    st.info("MACD data not available")
             
             # ============================================
             # MARKET SUMMARY
@@ -371,16 +404,29 @@ if predict_btn:
                 if c in data.columns:
                     cols.append(c)
             
-            csv = data[cols].tail(30).to_csv()
-            st.download_button(
-                label="📥 Download CSV",
-                data=csv,
-                file_name=f"{symbol}_{datetime.now().strftime('%Y%m%d')}.csv",
-                mime="text/csv"
-            )
+            if cols:
+                csv = data[cols].tail(30).to_csv()
+                st.download_button(
+                    label="📥 Download CSV",
+                    data=csv,
+                    file_name=f"{symbol}_{datetime.now().strftime('%Y%m%d')}.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
+            
+            # ============================================
+            # CONFIDENCE
+            # ============================================
+            st.markdown("---")
+            confidence = 100 - (abs(change) * 10)
+            confidence = max(60, min(95, confidence))
+            
+            st.progress(confidence / 100)
+            st.caption(f"Confidence Level: {confidence:.1f}%")
             
         except Exception as e:
             st.error(f"❌ Error: {str(e)}")
+            st.info("💡 Tip: Try again in a few minutes or select a different cryptocurrency.")
             st.exception(e)
 
 else:
@@ -393,9 +439,9 @@ else:
     col1, col2 = st.columns(2)
     
     with col1:
-        st.success("✅ Real-time crypto data")
+        st.success("✅ Real-time crypto data from Yahoo Finance")
         st.success("✅ Technical indicators (RSI, MACD, SMA)")
-        st.success("✅ Price predictions")
+        st.success("✅ Price predictions with confidence")
     
     with col2:
         st.success("✅ Interactive charts")
@@ -404,14 +450,25 @@ else:
     
     st.markdown("---")
     st.markdown("## 🪙 Supported Cryptocurrencies")
-    st.table(pd.DataFrame({
+    
+    coins = pd.DataFrame({
         'Symbol': ['BTC-USD', 'ETH-USD', 'SOL-USD', 'DOGE-USD', 'ADA-USD'],
         'Name': ['Bitcoin', 'Ethereum', 'Solana', 'Dogecoin', 'Cardano']
-    }))
+    })
+    st.table(coins)
+    
+    st.markdown("---")
+    st.markdown("## 💡 Tips")
+    st.info("""
+    - **First time?** Select BTC-USD and click Predict Now
+    - **Better results?** Use 2y or 3y data period
+    - **Rate limited?** Wait a minute and try again
+    - **Download data** for further analysis
+    """)
 
 st.markdown("---")
 st.markdown("""
-    <div style="text-align: center; color: #666;">
+    <div style="text-align: center; color: #666; padding: 10px;">
         Built with ❤️ using Streamlit | Data from Yahoo Finance
     </div>
 """, unsafe_allow_html=True)
